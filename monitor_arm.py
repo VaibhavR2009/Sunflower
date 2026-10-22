@@ -17,9 +17,32 @@ ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "face_landmarker.task"
 
 
-def send_angles(ser: serial.Serial, pan: float, tilt: float) -> None:
-    message = f"{pan:.1f},{tilt:.1f}\n"
+def send_angles(ser: serial.Serial, pan: float, tilt: float, lift: float) -> None:
+    message = f"{pan:.1f},{tilt:.1f},{lift:.1f}\n"
     ser.write(message.encode("ascii"))
+
+
+def open_camera(index: int) -> cv2.VideoCapture:
+    """Open the camera and wait until it actually hands us a frame.
+
+    The first read of a DirectShow capture often returns False if the device
+    has been sitting idle, so retry instead of treating it as fatal.
+    """
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open camera.")
+
+    for _ in range(30):
+        ok, _ = cap.read()
+        if ok:
+            return cap
+        time.sleep(0.1)
+
+    cap.release()
+    raise RuntimeError("Camera opened but never delivered a frame.")
 
 
 def main() -> None:
@@ -49,20 +72,23 @@ def main() -> None:
         min_tracking_confidence=0.5,
     )
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap.release()
-        cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open camera.")
-
     last_timestamp_ms = 0
 
     with vision.FaceLandmarker.create_from_options(options) as detector:
+        # Open only after the model is ready, so the capture has not gone idle
+        cap = open_camera(args.camera)
+
+        failures = 0
         while True:
             ok, frame = cap.read()
             if not ok:
-                break
+                failures += 1
+                if failures >= 30:
+                    print("Camera stopped delivering frames.")
+                    break
+                time.sleep(0.05)
+                continue
+            failures = 0
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -90,11 +116,11 @@ def main() -> None:
                 cv2.circle(frame, (px, py), 10, (0, 0, 255), -1)
                 cv2.line(frame, (w // 2, h // 2), (px, py), (255, 0, 255), 2)
 
-                text = f"Pan {angles.pan:5.1f}  Tilt {angles.tilt:5.1f}"
+                text = f"Pan {angles.pan:5.1f}  Tilt {angles.tilt:5.1f}  Lift {angles.lift:5.1f}"
                 cv2.putText(frame, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
 
                 if ser:
-                    send_angles(ser, angles.pan, angles.tilt)
+                    send_angles(ser, angles.pan, angles.tilt, angles.lift)
 
             cv2.imshow("VB Sunflower - Monitor Arm", frame)
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
